@@ -22,6 +22,22 @@ CRYPTOCURRENCIES = {
     '2': ('ETH', 'XETHZUSD'),
     '3': ('XRP', 'XXRPZUSD'),
     '4': ('LTC', 'XLTCZUSD'),
+    '5': ('ADA', 'ADAUSD'),
+    '6': ('DOT', 'DOTUSD'),
+    '7': ('SOL', 'SOLUSD'),
+    '8': ('LINK', 'LINKUSD'),
+    '9': ('UNI', 'UNIUSD'),
+    '10': ('AAVE', 'AAVEUSD'),
+    '11': ('SNX', 'SNXUSD'),
+    '12': ('YFI', 'YFIUSD'),
+    '13': ('COMP', 'COMPUSD'),
+    '14': ('MKR', 'MKRUSD'),
+    '15': ('BAL', 'BALUSD'),
+    '16': ('CRV', 'CRVUSD'),
+    '17': ('SUSHI', 'SUSHIUSD'),
+    '18': ('ALPHA', 'ALPHAUSD'),
+    '19': ('KEEP', 'KEEPUSD'),
+    '20': ('REN', 'RENUSD'),
 }
 
 INTERVALS = {
@@ -74,19 +90,6 @@ class LSTMModel(nn.Module):
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1, :])
-
-class TransformerModel(nn.Module):
-    def __init__(self, input_size=1, d_model=64, nhead=4, num_layers=2, dropout=0.2):
-        super(TransformerModel, self).__init__()
-        self.embedding = nn.Linear(input_size, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-        self.fc = nn.Linear(d_model, 1)
-
-    def forward(self, x):
-        x = self.embedding(x)
-        x = self.transformer(x)
-        return self.fc(x[:, -1, :])
 
 # --- Подготовка данных и обучение ---
 
@@ -168,20 +171,20 @@ def predict_future(model, scaler, last_sequence, predict_steps):
 
 # --- Визуализация ---
 
-def plot_interactive(df, val_df, predictions, interval_name, crypto_name):
-    """Создает интерактивный график с помощью Plotly и включает инструменты рисования."""
-    import plotly.graph_objects as go
-    
+def plot_interactive_with_signals(df, val_df, predictions, interval_name, crypto_name, entry_point, entry_time, exit_point, exit_time):
+    """Создает интерактивный график с торговыми сигналами."""
     fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=df.index, y=df['Price'], mode='lines', name='Историческая цена', line=dict(color='royalblue')))
     
+    fig.add_trace(go.Scatter(x=df.index, y=df['Price'], mode='lines', name='Историческая цена', line=dict(color='royalblue')))
+    fig.add_trace(go.Scatter(x=predictions['index'], y=predictions['values'], mode='lines', name='Прогноз', line=dict(color='red', dash='dash')))
     fig.add_vline(x=val_df.index[0], line=dict(color='gray', dash='dash'))
-
-    colors = {'LSTM': 'red', 'Transformer': 'green'}
-    for name, preds in predictions.items():
-        fig.add_trace(go.Scatter(x=preds['index'], y=preds['values'], mode='lines', name=f'Прогноз {name}', line=dict(color=colors[name], dash='dash')))
-
+    
+    # Добавление сигналов
+    if entry_point and entry_time:
+        fig.add_trace(go.Scatter(x=[entry_time], y=[entry_point], mode='markers', name='Вход', marker=dict(color='green', size=10)))
+    if exit_point and exit_time:
+        fig.add_trace(go.Scatter(x=[exit_time], y=[exit_point], mode='markers', name='Выход', marker=dict(color='orange', size=10)))
+    
     fig.update_layout(
         title=f'Прогноз цены {crypto_name} (интервал: {interval_name})',
         xaxis_title='Время',
@@ -190,78 +193,152 @@ def plot_interactive(df, val_df, predictions, interval_name, crypto_name):
         hovermode='x unified',
         legend_title_text='Легенда'
     )
-
-    # Добавляем аннотацию для начала валидации
-    fig.add_annotation(
-        x=val_df.index[0],
-        y=0.5,
-        text='Начало валидации',
-        showarrow=False,
-        yref='paper'
-    )
-
-    # Включаем инструменты рисования
+    
     config = {
-        'modeBarButtonsToAdd': [
-            'drawline',        # Рисование линий
-            'drawopenpath',    # Рисование открытых контуров
-            'drawclosedpath',  # Рисование замкнутых контуров
-            'drawcircle',      # Рисование кругов
-            'drawrect',        # Рисование прямоугольников
-            'eraseshape'       # Удаление нарисованных фигур
-        ]
+        'modeBarButtonsToAdd': ['drawline', 'drawcircle', 'drawrect', 'eraseshape']
     }
-
     fig.show(config=config)
+
+# --- Дополнительные функции ---
+
+def calculate_mse(model, val_loader, criterion=nn.MSELoss()):
+    """Вычисляет среднеквадратичную ошибку (MSE) на валидационном наборе."""
+    model.eval()
+    mse = 0
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+            outputs = model(inputs)
+            mse += criterion(outputs, targets).item()
+    return mse / len(val_loader)
+
+def find_best_crypto(cryptocurrencies, interval_minutes):
+    """Находит криптовалюту с наименьшим MSE на валидационном наборе."""
+    best_crypto = None
+    best_mse = float('inf')
+    best_model = None
+    best_predictions = None
+    best_df = None
+    best_val_df = None
+    best_scaler = None
+    
+    for key, (name, symbol) in cryptocurrencies.items():
+        print(f"\nАнализ {name}...")
+        df = get_historical_data(symbol, interval_minutes)
+        if df is None or len(df) < SEQ_LENGTH * 2:
+            print(f"Недостаточно данных для {name}.")
+            continue
+        
+        # Разделение данных
+        train_size = int(len(df) * 0.8)
+        train_df, val_df = df.iloc[:train_size], df.iloc[train_size:]
+        
+        # Нормализация
+        scaler = MinMaxScaler()
+        scaled_train_data = scaler.fit_transform(train_df)
+        scaled_val_data = scaler.transform(val_df)
+        
+        # Создание последовательностей
+        X_train, y_train = create_sequences(scaled_train_data, SEQ_LENGTH)
+        X_val, y_val = create_sequences(scaled_val_data, SEQ_LENGTH)
+        
+        if len(X_val) == 0:
+            print(f"Недостаточно данных для валидации {name}.")
+            continue
+        
+        # Подготовка датасетов
+        train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+        val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.float32))
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        
+        # Обучение модели (используем LSTM как пример)
+        model = LSTMModel().to(DEVICE)
+        trained_model = train_model(model, train_loader, val_loader)
+        
+        # Оценка MSE
+        mse = calculate_mse(trained_model, val_loader)
+        print(f"{name} MSE: {mse:.6f}")
+        
+        if mse < best_mse:
+            best_mse = mse
+            best_crypto = name
+            best_model = trained_model
+            best_df = df
+            best_val_df = val_df
+            best_scaler = scaler
+            
+            # Прогноз
+            last_sequence_scaled = scaler.transform(df.iloc[-SEQ_LENGTH:])
+            future_preds = predict_future(trained_model, scaler, last_sequence_scaled, PREDICT_STEPS)
+            last_time = df.index[-1]
+            freq_str = f"{interval_minutes}min"
+            future_index = pd.date_range(start=last_time, periods=PREDICT_STEPS + 1, freq=freq_str)[1:]
+            best_predictions = {'values': future_preds, 'index': future_index}
+    
+    return best_crypto, best_model, best_df, best_val_df, best_predictions, best_mse, best_scaler
+
+def get_trade_signals(predictions, current_price, profit_target=0.05, entry_threshold=0.01):
+    """Определяет точки входа и выхода на основе прогноза."""
+    entry_point = None
+    exit_point = None
+    entry_time = None
+    exit_time = None
+    
+    pred_values = predictions['values']
+    pred_index = predictions['index']
+    
+    # Проверка условий входа
+    for i in range(len(pred_values) - 1):
+        if (pred_values[i + 1] - current_price) / current_price >= entry_threshold:
+            entry_point = pred_values[i]
+            entry_time = pred_index[i]
+            break
+    
+    # Проверка условий выхода
+    if entry_point:
+        for i in range(len(pred_values)):
+            if pred_values[i] >= entry_point * (1 + profit_target):
+                exit_point = pred_values[i]
+                exit_time = pred_index[i]
+                break
+            elif i > 0 and pred_values[i] < pred_values[i - 1]:  # Начало падения
+                exit_point = pred_values[i]
+                exit_time = pred_index[i]
+                break
+    
+    return entry_point, entry_time, exit_point, exit_time
+
 # --- Основная функция ---
 
 def main():
-    crypto_name, crypto_symbol = select_option(CRYPTOCURRENCIES, "Выберите криптовалюту:", '1')
-    interval_minutes, interval_name = select_option(INTERVALS, f"Выберите интервал для {crypto_name}:", '2')
-
-    df = get_historical_data(crypto_symbol, interval_minutes)
-    if df is None or len(df) < SEQ_LENGTH * 2:
-        print("Недостаточно данных для анализа. Попробуйте больший интервал или другую валюту.")
-        return
-
-    train_size = int(len(df) * 0.8)
-    train_df, val_df = df.iloc[:train_size], df.iloc[train_size:]
-
+    interval_minutes, interval_name = select_option(INTERVALS, "Выберите интервал:", '2')
     
-    scaler = MinMaxScaler()
-    scaled_train_data = scaler.fit_transform(train_df)
-    scaled_val_data = scaler.transform(val_df)
+    # Поиск лучшей криптовалюты
+    best_crypto, best_model, best_df, best_val_df, best_predictions, best_mse, best_scaler = find_best_crypto(CRYPTOCURRENCIES, interval_minutes)
     
-    X_train, y_train = create_sequences(scaled_train_data, SEQ_LENGTH)
-    X_val, y_val = create_sequences(scaled_val_data, SEQ_LENGTH)
-
-    if len(X_val) == 0:
-        print("❌ Ошибка: Недостаточно данных для создания валидационного набора. Попробуйте больший период.")
+    if not best_crypto:
+        print("Не удалось найти подходящую криптовалюту для анализа.")
         return
-
-    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-    val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.float32))
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    models_to_train = {'LSTM': LSTMModel(), 'Transformer': TransformerModel()}
-    all_predictions = {}
-
-   
-    for name, model_instance in models_to_train.items():
-        trained_model = train_model(model_instance, train_loader, val_loader)
-        
-        last_sequence_scaled = scaler.transform(df.iloc[-SEQ_LENGTH:])
-        future_preds = predict_future(trained_model, scaler, last_sequence_scaled, PREDICT_STEPS)
-        
-        last_time = df.index[-1]
-        freq_str = f"{interval_minutes}min"
-        future_index = pd.date_range(start=last_time, periods=PREDICT_STEPS + 1, freq=freq_str)[1:]
-        
-        all_predictions[name] = {'values': future_preds, 'index': future_index}
-
-  
-    plot_interactive(df, val_df, all_predictions, interval_name, crypto_name)
+    
+    print(f"\n✅ Лучшая криптовалюта: {best_crypto} с MSE: {best_mse:.6f}")
+    
+    # Определение торговых сигналов
+    current_price = best_df['Price'].iloc[-1]
+    entry_point, entry_time, exit_point, exit_time = get_trade_signals(best_predictions, current_price)
+    
+    if entry_point:
+        print(f"Точка входа: {entry_point:.2f} USD в {entry_time}")
+    else:
+        print("Нет подходящей точки входа.")
+    
+    if exit_point:
+        print(f"Точка выхода: {exit_point:.2f} USD в {exit_time}")
+    else:
+        print("Нет точки выхода или прогноз не достиг цели прибыли.")
+    
+    # Визуализация
+    plot_interactive_with_signals(best_df, best_val_df, best_predictions, interval_name, best_crypto, entry_point, entry_time, exit_point, exit_time)
 
 if __name__ == "__main__":
     main()
