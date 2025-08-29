@@ -2,6 +2,7 @@ import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.preprocessing import MinMaxScaler
 import torch
 import torch.nn as nn
@@ -28,16 +29,7 @@ CRYPTOCURRENCIES = {
     '8': ('LINK', 'LINKUSD'),
     '9': ('UNI', 'UNIUSD'),
     '10': ('AAVE', 'AAVEUSD'),
-    '11': ('SNX', 'SNXUSD'),
-    '12': ('YFI', 'YFIUSD'),
-    '13': ('COMP', 'COMPUSD'),
-    '14': ('MKR', 'MKRUSD'),
-    '15': ('BAL', 'BALUSD'),
-    '16': ('CRV', 'CRVUSD'),
-    '17': ('SUSHI', 'SUSHIUSD'),
-    '18': ('ALPHA', 'ALPHAUSD'),
-    '19': ('KEEP', 'KEEPUSD'),
-    '20': ('REN', 'RENUSD'),
+
 }
 
 INTERVALS = {
@@ -64,20 +56,28 @@ def get_historical_data(symbol, interval):
         response = requests.get(url, timeout=10).json()
         if 'error' in response and response['error']:
             raise ValueError(f"Ошибка API: {response['error']}")
-        
         data_key = next(iter(response['result']))
         data = response['result'].get(data_key, [])
-        
         if not data:
             raise ValueError("Нет данных для указанной пары.")
-            
         timestamps = [int(candle[0]) for candle in data]
-        prices = [float(candle[4]) for candle in data]  # Цена закрытия
-        df = pd.DataFrame({'Price': prices}, index=pd.to_datetime(timestamps, unit='s'))
+        ohlcv = [[float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[6])] for candle in data]  # open, high, low, close, volume
+        df = pd.DataFrame(ohlcv, columns=['Open', 'High', 'Low', 'Close', 'Volume'], index=pd.to_datetime(timestamps, unit='s'))
         return df
     except Exception as e:
         print(f"❌ Ошибка при получении данных: {e}")
         return None
+
+def calculate_rsi(data, period=14):
+    """Расчет RSI для серии цен."""
+    delta = data.diff(1)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 # --- Модели ---
 
@@ -109,9 +109,7 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, patience=10):
     best_loss = float('inf')
     patience_counter = 0
     model_save_path = 'best_model.pth'
-    
     print(f"\n🚀 Обучение модели {type(model).__name__} на {DEVICE}...")
-    
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -123,7 +121,6 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, patience=10):
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-        
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -134,7 +131,6 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, patience=10):
 
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
-        
         print(f"Эпоха {epoch+1}/{epochs}, Потери при обучении: {train_loss:.6f}, Потери при валидации: {val_loss:.6f}")
 
         if val_loss < best_loss:
@@ -146,54 +142,72 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, patience=10):
             if patience_counter >= patience:
                 print(f"⌛ Ранний останов на эпохе {epoch+1}. Лучшая валидационная потеря: {best_loss:.6f}")
                 break
-    
     model.load_state_dict(torch.load(model_save_path))
     if os.path.exists(model_save_path):
-        os.remove(model_save_path) 
+        os.remove(model_save_path)
     return model
 
 def predict_future(model, scaler, last_sequence, predict_steps):
     """Авторегрессионное предсказание на N шагов вперед."""
     model.eval()
-    
     last_sequence_tensor = torch.tensor(last_sequence.reshape(1, -1, 1), dtype=torch.float32).to(DEVICE)
-    
     predictions_scaled = []
     with torch.no_grad():
         for _ in range(predict_steps):
             pred = model(last_sequence_tensor)
             predictions_scaled.append(pred.item())
-            
             new_pred_tensor = pred.reshape(1, 1, 1)
             last_sequence_tensor = torch.cat([last_sequence_tensor[:, 1:, :], new_pred_tensor], dim=1)
-            
     return scaler.inverse_transform(np.array(predictions_scaled).reshape(-1, 1)).flatten()
 
 # --- Визуализация ---
 
 def plot_interactive_with_signals(df, val_df, predictions, interval_name, crypto_name, entry_point, entry_time, exit_point, exit_time):
-    """Создает интерактивный график с торговыми сигналами."""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(x=df.index, y=df['Price'], mode='lines', name='Историческая цена', line=dict(color='royalblue')))
-    fig.add_trace(go.Scatter(x=predictions['index'], y=predictions['values'], mode='lines', name='Прогноз', line=dict(color='red', dash='dash')))
-    fig.add_vline(x=val_df.index[0], line=dict(color='gray', dash='dash'))
-    
-    # Добавление сигналов
+    """Создает интерактивный график с торговыми сигналами и RSI."""
+    rsi_series = calculate_rsi(df['Close'])
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3],
+                        subplot_titles=(f'Прогноз цены {crypto_name} (интервал: {interval_name})', 'RSI'))
+
+    # Candlestick для исторических данных
+    fig.add_trace(go.Candlestick(x=df.index,
+                                 open=df['Open'],
+                                 high=df['High'],
+                                 low=df['Low'],
+                                 close=df['Close'],
+                                 name='Историческая цена'),
+                  row=1, col=1)
+
+    # Прогноз
+    fig.add_trace(go.Scatter(x=predictions['index'], y=predictions['values'], mode='lines', name='Прогноз', line=dict(color='red', dash='dash')),
+                  row=1, col=1)
+
+    # Линия разделения train/val
+    fig.add_vline(x=val_df.index[0], line=dict(color='gray', dash='dash'), row=1, col=1)
+
+    # Сигналы
     if entry_point and entry_time:
-        fig.add_trace(go.Scatter(x=[entry_time], y=[entry_point], mode='markers', name='Вход', marker=dict(color='green', size=10)))
+        fig.add_trace(go.Scatter(x=[entry_time], y=[entry_point], mode='markers', name='Вход', marker=dict(color='green', size=10)),
+                      row=1, col=1)
     if exit_point and exit_time:
-        fig.add_trace(go.Scatter(x=[exit_time], y=[exit_point], mode='markers', name='Выход', marker=dict(color='orange', size=10)))
-    
+        fig.add_trace(go.Scatter(x=[exit_time], y=[exit_point], mode='markers', name='Выход', marker=dict(color='orange', size=10)),
+                      row=1, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(x=df.index, y=rsi_series, mode='lines', name='RSI', line=dict(color='purple')),
+                  row=2, col=1)
+    fig.add_hline(y=70, row=2, col=1, line_dash="dash", line_color="red")
+    fig.add_hline(y=30, row=2, col=1, line_dash="dash", line_color="green")
+
     fig.update_layout(
-        title=f'Прогноз цены {crypto_name} (интервал: {interval_name})',
         xaxis_title='Время',
         yaxis_title='Цена (USD)',
+        yaxis2_title='RSI',
         template='plotly_white',
         hovermode='x unified',
-        legend_title_text='Легенда'
+        legend_title_text='Легенда',
+        showlegend=True
     )
-    
     config = {
         'modeBarButtonsToAdd': ['drawline', 'drawcircle', 'drawrect', 'eraseshape']
     }
@@ -233,10 +247,10 @@ def find_best_crypto(cryptocurrencies, interval_minutes):
         train_size = int(len(df) * 0.8)
         train_df, val_df = df.iloc[:train_size], df.iloc[train_size:]
         
-        # Нормализация
+        # Нормализация (используем Close для предсказания)
         scaler = MinMaxScaler()
-        scaled_train_data = scaler.fit_transform(train_df)
-        scaled_val_data = scaler.transform(val_df)
+        scaled_train_data = scaler.fit_transform(train_df[['Close']])
+        scaled_val_data = scaler.transform(val_df[['Close']])
         
         # Создание последовательностей
         X_train, y_train = create_sequences(scaled_train_data, SEQ_LENGTH)
@@ -252,7 +266,7 @@ def find_best_crypto(cryptocurrencies, interval_minutes):
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
         
-        # Обучение модели (используем LSTM как пример)
+        # Обучение модели
         model = LSTMModel().to(DEVICE)
         trained_model = train_model(model, train_loader, val_loader)
         
@@ -269,10 +283,16 @@ def find_best_crypto(cryptocurrencies, interval_minutes):
             best_scaler = scaler
             
             # Прогноз
-            last_sequence_scaled = scaler.transform(df.iloc[-SEQ_LENGTH:])
+            last_sequence_scaled = scaler.transform(df[['Close']].iloc[-SEQ_LENGTH:])
             future_preds = predict_future(trained_model, scaler, last_sequence_scaled, PREDICT_STEPS)
             last_time = df.index[-1]
-            freq_str = f"{interval_minutes}min"
+            
+            # Создание временного индекса для прогноза
+            if interval_minutes == 1440:  # daily
+                freq_str = 'D'
+            else:
+                freq_str = f"{interval_minutes}min"
+                
             future_index = pd.date_range(start=last_time, periods=PREDICT_STEPS + 1, freq=freq_str)[1:]
             best_predictions = {'values': future_preds, 'index': future_index}
     
@@ -321,10 +341,27 @@ def main():
         print("Не удалось найти подходящую криптовалюту для анализа.")
         return
     
-    print(f"\n✅ Лучшая криптовалюта: {best_crypto} с MSE: {best_mse:.6f}")
+    current_price = best_df['Close'].iloc[-1]
+    rsi = calculate_rsi(best_df['Close']).iloc[-1]
+    
+    # Расчет прогнозируемого pump
+    if best_predictions['values'].size > 0:
+        max_pred_price = max(best_predictions['values'])
+        pump_percent = ((max_pred_price - current_price) / current_price) * 100
+    else:
+        max_pred_price = current_price
+        pump_percent = 0
+    
+    last_volume = best_df['Volume'].iloc[-1]  # Последний объем
+    
+    # Форматированный вывод как на скриншоте
+    print(f"#{best_crypto} Pump: {pump_percent:.2f}% ({current_price:.5f} > {max_pred_price:.5f})")
+    print("Trade: Kraken")
+    print(f"100 / {last_volume:.2f} / N/A / {current_price:.4f}")
+    print(f"RSI: {rsi:.1f}%")
+    print("Rep. ссылка: https://www.kraken.com/prices")
     
     # Определение торговых сигналов
-    current_price = best_df['Price'].iloc[-1]
     entry_point, entry_time, exit_point, exit_time = get_trade_signals(best_predictions, current_price)
     
     if entry_point:
